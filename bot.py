@@ -100,7 +100,7 @@ async def hybrid_pipeline_worker(event, seq, chat_queue, file_media, file_name, 
                 
                 # Process
                 ext = os.path.splitext(file_name)[1].lower()
-                await asyncio.to_thread(process_metadata, local_path, ext, f"Ep {ep_num}", "@AllstoryFM2", "Single", image_data)
+                await asyncio.to_thread(process_metadata, local_path, ext, f"Ep {ep_num}", "@AllstoryFM2 JOIN", "Single", image_data)
             
             # Sequential Upload with Watchdog
             async with chat_queue.condition:
