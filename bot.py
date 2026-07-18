@@ -22,7 +22,7 @@ logger = logging.getLogger("TaggerBot")
 # --- Railway/Environment Variables (Security) ---
 API_ID = int(os.environ.get("API_ID", 34801155))
 API_HASH = os.environ.get("API_HASH", "d7846c4d0f2c343dd5b67c80d45409e8")
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8881589159:AAE_3rsISHa9DrWZuAMcDkMClmVZmem2Acc")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8949289098:AAHtP1BrSBVXWCLhV-rOb0nLmeh0u11qTqM")
 
 # --- Globals for Speed ---
 DOWNLOAD_SEMAPHORE = asyncio.Semaphore(10) # 10 parallel tasks for speed
