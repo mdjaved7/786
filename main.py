@@ -398,21 +398,10 @@ async def incoming_message_handler(event: events.NewMessage.Event) -> None:
                 
             await update_dashboard(bot, chat_id, chat_queue)
         else:
-            await event.respond("ℹ️ **पहले मुझे एक ऑडियो फाइल भेजें**।")
+            await event.respond("ℹ️ **पहले मुझे एक AUDIO फाइल भेजें**।")
 
 # --- Hybrid Pipeline Worker (The Core Engine) ---
 async def hybrid_pipeline_worker(event: events.NewMessage.Event, seq: int, chat_queue: ChatQueue, file_media: Any, file_name: str, image_url: str, caption_text: str) -> None:
-    chat_id = event.chat_id
-    ep_num = extract_episode_number(file_name, caption_text)
-    current_task = asyncio.current_task()
-    
-    if chat_queue.cancelled:
-        return
-
-    try:
-        with tempfile.TemporaryDirectory() as temp_dir:
-# --- Hybrid Pipeline Worker (The Core Engine) - UPDATED FOR M4A FIX ---
-    async def hybrid_pipeline_worker(event: events.NewMessage.Event, seq: int, chat_queue: ChatQueue, file_media: Any, file_name: str, image_url: str, caption_text: str) -> None:
     chat_id = event.chat_id
     ep_num = extract_episode_number(file_name, caption_text)
     current_task = asyncio.current_task()
@@ -543,10 +532,6 @@ async def hybrid_pipeline_worker(event: events.NewMessage.Event, seq: int, chat_
             if not chat_queue.cancelled:
                 await update_dashboard(bot, chat_id, chat_queue)
 
-        else:
-            if not chat_queue.cancelled:
-                await update_dashboard(bot, chat_id, chat_queue)
-
 async def main() -> None:
     await bot.start(bot_token=BOT_TOKEN)
     logger.info("🚀 Production Bot authenticated successfully. Ready for 10,000+ files.")
@@ -556,4 +541,4 @@ async def main() -> None:
 
 if __name__ == "__main__":
     try: asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit): logger.info("Bot stopped cleanly.") 
+    except (KeyboardInterrupt, SystemExit): logger.info("Bot stopped cleanly.")
