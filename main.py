@@ -411,6 +411,17 @@ async def hybrid_pipeline_worker(event: events.NewMessage.Event, seq: int, chat_
 
     try:
         with tempfile.TemporaryDirectory() as temp_dir:
+# --- Hybrid Pipeline Worker (The Core Engine) - UPDATED FOR M4A FIX ---
+async def hybrid_pipeline_worker(event: events.NewMessage.Event, seq: int, chat_queue: ChatQueue, file_media: Any, file_name: str, image_url: str, caption_text: str) -> None:
+    chat_id = event.chat_id
+    ep_num = extract_episode_number(file_name, caption_text)
+    current_task = asyncio.current_task()
+    
+    if chat_queue.cancelled:
+        return
+
+    try:
+        with tempfile.TemporaryDirectory() as temp_dir:
             local_audio_path = os.path.join(temp_dir, file_name)
             
             # ----------------------------------------
@@ -423,12 +434,18 @@ async def hybrid_pipeline_worker(event: events.NewMessage.Event, seq: int, chat_
                 
                 if chat_queue.cancelled: return
                 
-                image_data = await download_image_from_tg(bot, image_url)
+                # इमेज डाउनलोड का सुरक्षित प्रयास
+                image_data = None
+                try:
+                    image_data = await download_image_from_tg(bot, image_url)
+                    if not image_data:
+                        image_data = await download_image_from_url(image_url)
+                except Exception as img_err:
+                    logger.error(f"Image download error: {img_err}")
+
+                # अगर इमेज लिंक काम नहीं किया तो डमी इमेज या एरर हैंडलिंग
                 if not image_data:
-                    image_data = await download_image_from_url(image_url)
-                    
-                if not image_data:
-                    raise ValueError(f"Failed to fetch image for Ep {ep_num}")
+                    raise ValueError(f"Failed to fetch image from provided link for Ep {ep_num}")
 
                 if chat_queue.cancelled: return
 
@@ -437,9 +454,10 @@ async def hybrid_pipeline_worker(event: events.NewMessage.Event, seq: int, chat_
                 ext = os.path.splitext(file_name)[1].lower()
                 
                 success = False
+                # MP3 और M4A दोनों फ़ॉर्मेट के लिए सही कंडीशन मैपिंग
                 if ext == '.mp3':
                     success = await asyncio.to_thread(process_mp3_metadata, local_audio_path, title, ARTIST_NAME, album, image_data)
-                elif ext == '.m4a':
+                elif ext in ['.m4a', '.mp4']:
                     success = await asyncio.to_thread(process_m4a_metadata, local_audio_path, title, ARTIST_NAME, album, image_data)
                     
                 if not success:
@@ -480,7 +498,7 @@ async def hybrid_pipeline_worker(event: events.NewMessage.Event, seq: int, chat_
         logger.info(f"Task for Ep {ep_num} cancelled gracefully.")
     except Exception as e:
         logger.error(f"Error in pipeline for Ep {ep_num}: {str(e)}")
-        # Log failure, increase failed count. DO NOT spam chat.
+        # फ़ेल होने पर काउंटर बढ़ेगा ताकि कतार अटके नहीं
         async with chat_queue.lock:
             if not chat_queue.cancelled:
                 chat_queue.failed_count += 1
@@ -488,7 +506,7 @@ async def hybrid_pipeline_worker(event: events.NewMessage.Event, seq: int, chat_
         is_finished = False
         msg_to_delete = None
         
-         # 1. Cleanup Task & Increment Processed
+        # 1. Cleanup Task & Increment Processed
         async with chat_queue.lock:
             if current_task and current_task in chat_queue.active_tasks:
                 chat_queue.active_tasks.remove(current_task)
@@ -508,7 +526,6 @@ async def hybrid_pipeline_worker(event: events.NewMessage.Event, seq: int, chat_
                 msg_to_delete = chat_queue.queue_message
                 chat_queue.queue_message = None
                 
-                # Reset Queue (only if not cancelled, /clear handles its own reset)
                 if not chat_queue.cancelled:
                     chat_queue.total_count = 0
                     chat_queue.completed_count = 0
@@ -522,6 +539,10 @@ async def hybrid_pipeline_worker(event: events.NewMessage.Event, seq: int, chat_
         if is_finished:
             if msg_to_delete:
                 asyncio.create_task(safe_delete_message(msg_to_delete))
+        else:
+            if not chat_queue.cancelled:
+                await update_dashboard(bot, chat_id, chat_queue)
+
         else:
             if not chat_queue.cancelled:
                 await update_dashboard(bot, chat_id, chat_queue)
