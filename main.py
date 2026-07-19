@@ -210,13 +210,11 @@ async def update_dashboard(client: TelegramClient, chat_id: int, chat_queue: Cha
             except MessageNotModifiedError:
                 pass
             except FloodWaitError as e:
-                # Do NOT sleep here! We skip this update cycle to not delay the whole queue.
                 logger.warning(f"FloodWait on dashboard edit! Skipped for {e.seconds}s")
         elif not is_finished:
             try:
                 new_msg = await client.send_message(chat_id, text)
                 async with chat_queue.lock:
-                    # Double-check cancellation while waiting for network
                     if not chat_queue.cancelled:
                         chat_queue.queue_message = new_msg
             except FloodWaitError as e:
@@ -316,19 +314,15 @@ async def clear_handler(event: events.NewMessage.Event) -> None:
     if queue:
         async with queue.lock:
             queue.cancelled = True
-            
-            # Cancel all running tasks
             for task in list(queue.active_tasks):
                 if not task.done():
                     task.cancel()
             queue.active_tasks.clear()
             
-            # Request deletion of dashboard
             if queue.queue_message:
                 asyncio.create_task(safe_delete_message(queue.queue_message))
                 queue.queue_message = None
             
-            # Total Reset
             queue.total_count = 0
             queue.completed_count = 0
             queue.processed_count = 0
@@ -337,7 +331,6 @@ async def clear_handler(event: events.NewMessage.Event) -> None:
             queue.current_upload_seq = 0
             queue.current_uploading = "None"
         
-        # Release all blocked tasks waiting on condition
         async with queue.condition:
             queue.condition.notify_all()
             
@@ -351,12 +344,14 @@ async def incoming_message_handler(event: events.NewMessage.Event) -> None:
     if message.text and (message.text.startswith('/start') or message.text.startswith('/clear')): 
         return
 
+    # 1. ऑडियो फ़ाइल मिलने पर
     if message.file and message.file.ext.lower() in ['.mp3', '.m4a']:
         raw_name = message.file.name or f"audio{message.file.ext}"
         file_name = sanitize_filename(raw_name)
         caption_text = message.message or ""
         url_match = re.search(r'(https?://[^\s]+)', caption_text)
         
+        # अगर ऑडियो के साथ ही कैप्शन में लिंक मौजूद है
         if url_match:
             chat_queue = get_chat_queue(chat_id)
             async with chat_queue.lock:
@@ -369,20 +364,27 @@ async def incoming_message_handler(event: events.NewMessage.Event) -> None:
             async with chat_queue.lock:
                 chat_queue.active_tasks.add(task)
             
-            # Trigger dashboard update
             await update_dashboard(bot, chat_id, chat_queue)
             return
             
         pending_files[chat_id] = {"media": message.media, "file_name": file_name, "timestamp": time.time()}
-        await event.respond("📥 **ऑडियो फाइल मिल गई!** अब फोटो का लिंक भेजें।")
+        await event.respond("📥 **ऑडियो फाइल मिल गई!** अब फोटो का लिंक भेजें या सीधे फोटो अपलोड करें।")
         return
 
-    elif message.text and not message.text.startswith('/'):
-        input_url = message.text.strip()
-        url_match = re.search(r'(https?://[^\s]+)', input_url)
-        if not url_match: return
-            
-        if chat_id in pending_files:
+    # 2. फ़ोटो या लिंक मिलने पर (जब पहले से ऑडियो पेंडिंग हो)
+    elif chat_id in pending_files:
+        image_to_use = None
+        
+        if message.photo:
+            image_to_use = message.photo
+        elif message.document and message.document.mime_type and message.document.mime_type.startswith('image/'):
+            image_to_use = message.document
+        elif message.text and not message.text.startswith('/'):
+            url_match = re.search(r'(https?://[^\s]+)', message.text.strip())
+            if url_match:
+                image_to_use = url_match.group(1)
+
+        if image_to_use:
             file_data = pending_files.pop(chat_id)
             chat_queue = get_chat_queue(chat_id)
             
@@ -392,16 +394,19 @@ async def incoming_message_handler(event: events.NewMessage.Event) -> None:
                 seq = chat_queue.next_assign_seq
                 chat_queue.next_assign_seq += 1
                 
-            task = asyncio.create_task(hybrid_pipeline_worker(event, seq, chat_queue, file_data["media"], file_data["file_name"], url_match.group(1), ""))
+            task = asyncio.create_task(hybrid_pipeline_worker(event, seq, chat_queue, file_data["media"], file_data["file_name"], image_to_use, ""))
             async with chat_queue.lock:
                 chat_queue.active_tasks.add(task)
                 
             await update_dashboard(bot, chat_id, chat_queue)
         else:
+            await event.respond("⚠️ कृपया एक वैध फोटो लिंक भेजें या सीधे फोटो अपलोड करें।")
+    else:
+        if message.text and not message.text.startswith('/'):
             await event.respond("ℹ️ **पहले मुझे एक AUDIO फाइल भेजें**।")
 
 # --- Hybrid Pipeline Worker (The Core Engine) ---
-async def hybrid_pipeline_worker(event: events.NewMessage.Event, seq: int, chat_queue: ChatQueue, file_media: Any, file_name: str, image_url: str, caption_text: str) -> None:
+async def hybrid_pipeline_worker(event: events.NewMessage.Event, seq: int, chat_queue: ChatQueue, file_media: Any, file_name: str, image_url: Any, caption_text: str) -> None:
     chat_id = event.chat_id
     ep_num = extract_episode_number(file_name, caption_text)
     current_task = asyncio.current_task()
@@ -413,9 +418,7 @@ async def hybrid_pipeline_worker(event: events.NewMessage.Event, seq: int, chat_
         with tempfile.TemporaryDirectory() as temp_dir:
             local_audio_path = os.path.join(temp_dir, file_name)
             
-            # ----------------------------------------
-            # Phase 1: Parallel Processing (Download & Meta)
-            # ----------------------------------------
+            # Phase 1: Parallel Processing
             async with DOWNLOAD_SEMAPHORE:
                 if chat_queue.cancelled: return
                 
@@ -423,18 +426,19 @@ async def hybrid_pipeline_worker(event: events.NewMessage.Event, seq: int, chat_
                 
                 if chat_queue.cancelled: return
                 
-                # इमेज डाउनलोड का सुरक्षित प्रयास
                 image_data = None
                 try:
-                    image_data = await download_image_from_tg(bot, image_url)
-                    if not image_data:
-                        image_data = await download_image_from_url(image_url)
+                    if isinstance(image_url, str):
+                        image_data = await download_image_from_tg(bot, image_url)
+                        if not image_data:
+                            image_data = await download_image_from_url(image_url)
+                    else:
+                        image_data = await bot.download_media(image_url, bytes)
                 except Exception as img_err:
                     logger.error(f"Image download error: {img_err}")
 
-                # अगर इमेज लिंक काम नहीं किया तो डमी इमेज या एरर हैंडलिंग
                 if not image_data:
-                    raise ValueError(f"Failed to fetch image from provided link for Ep {ep_num}")
+                    raise ValueError(f"Failed to fetch image for Ep {ep_num}")
 
                 if chat_queue.cancelled: return
 
@@ -443,7 +447,6 @@ async def hybrid_pipeline_worker(event: events.NewMessage.Event, seq: int, chat_
                 ext = os.path.splitext(file_name)[1].lower()
                 
                 success = False
-                # MP3 और M4A दोनों फ़ॉर्मेट के लिए सही कंडीशन मैपिंग
                 if ext == '.mp3':
                     success = await asyncio.to_thread(process_mp3_metadata, local_audio_path, title, ARTIST_NAME, album, image_data)
                 elif ext in ['.m4a', '.mp4']:
@@ -457,9 +460,7 @@ async def hybrid_pipeline_worker(event: events.NewMessage.Event, seq: int, chat_
                 with open(thumb_path, "wb") as f: f.write(image_data)
                 audio_attributes = [DocumentAttributeAudio(duration=duration, title=title, performer=ARTIST_NAME)]
 
-            # ----------------------------------------
             # Phase 2: Strict Sequential Upload 
-            # ----------------------------------------
             async with chat_queue.condition:
                 while chat_queue.current_upload_seq != seq:
                     if chat_queue.cancelled: return
@@ -467,11 +468,9 @@ async def hybrid_pipeline_worker(event: events.NewMessage.Event, seq: int, chat_
                 
                 if chat_queue.cancelled: return
                 
-                # TURN ACQUIRED
                 async with chat_queue.lock:
                     chat_queue.current_uploading = f"Ep {ep_num}"
                     
-                # Force update dashboard immediately for visual feedback
                 await update_dashboard(bot, chat_id, chat_queue, force=True)
                 
                 await safe_send_file(
@@ -487,7 +486,6 @@ async def hybrid_pipeline_worker(event: events.NewMessage.Event, seq: int, chat_
         logger.info(f"Task for Ep {ep_num} cancelled gracefully.")
     except Exception as e:
         logger.error(f"Error in pipeline for Ep {ep_num}: {str(e)}")
-        # फ़ेल होने पर काउंटर बढ़ेगा ताकि कतार अटके नहीं
         async with chat_queue.lock:
             if not chat_queue.cancelled:
                 chat_queue.failed_count += 1
@@ -495,20 +493,16 @@ async def hybrid_pipeline_worker(event: events.NewMessage.Event, seq: int, chat_
         is_finished = False
         msg_to_delete = None
         
-        # 1. Cleanup Task & Increment Processed
         async with chat_queue.lock:
             if current_task and current_task in chat_queue.active_tasks:
                 chat_queue.active_tasks.remove(current_task)
-            
             chat_queue.processed_count += 1
 
-        # 2. Advance the queue securely
         async with chat_queue.condition:
             if chat_queue.current_upload_seq == seq:
                 chat_queue.current_upload_seq += 1
                 chat_queue.condition.notify_all()
 
-        # 3. Check for absolute completion & trigger cleanup
         async with chat_queue.lock:
             if chat_queue.total_count > 0 and chat_queue.processed_count >= chat_queue.total_count:
                 is_finished = True
@@ -524,7 +518,6 @@ async def hybrid_pipeline_worker(event: events.NewMessage.Event, seq: int, chat_
                     chat_queue.current_upload_seq = 0
                     chat_queue.current_uploading = "None"
                     
-        # 4. Final Updates Outside the Lock
         if is_finished:
             if msg_to_delete:
                 asyncio.create_task(safe_delete_message(msg_to_delete))
@@ -540,5 +533,7 @@ async def main() -> None:
     await bot.run_until_disconnected()
 
 if __name__ == "__main__":
-    try: asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit): logger.info("Bot stopped cleanly.")
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Bot stopped cleanly.")
