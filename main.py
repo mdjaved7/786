@@ -412,7 +412,7 @@ async def hybrid_pipeline_worker(event: events.NewMessage.Event, seq: int, chat_
     try:
         with tempfile.TemporaryDirectory() as temp_dir:
 # --- Hybrid Pipeline Worker (The Core Engine) - UPDATED FOR M4A FIX ---
-async def hybrid_pipeline_worker(event: events.NewMessage.Event, seq: int, chat_queue: ChatQueue, file_media: Any, file_name: str, image_url: str, caption_text: str) -> None:
+    async def hybrid_pipeline_worker(event: events.NewMessage.Event, seq: int, chat_queue: ChatQueue, file_media: Any, file_name: str, image_url: str, caption_text: str) -> None:
     chat_id = event.chat_id
     ep_num = extract_episode_number(file_name, caption_text)
     current_task = asyncio.current_task()
