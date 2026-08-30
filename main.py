@@ -4,10 +4,10 @@ import logging
 import asyncio
 import tempfile
 import aiohttp
-from typing import Optional, Tuple, Dict
+from typing import Optional, Tuple, Dict, List
 
 # Telethon Imports
-from telethon import TelegramClient, events, Button
+from telethon import TelegramClient, events
 from telethon.tl.types import DocumentAttributeAudio
 
 # Mutagen Imports
@@ -23,7 +23,7 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s",
     level=logging.INFO
 )
-logger = logging.getLogger("GetStartedTaggerBot")
+logger = logging.getLogger("BatchProcessTaggerBot")
 
 # --- Environment Variables ---
 API_ID = 34801155
@@ -32,10 +32,10 @@ BOT_TOKEN = "8949289098:AAHtP1BrSBVXWCLhV-rOb0nLmeh0u11qTqM"
 
 ALLOWED_EXTENSIONS = {'.mp3', '.m4a', '.mp4', '.ogg', '.flac'}
 
-# --- State Management (Per-Chat Queue, Episode Counter & Pending Messages) ---
+# --- Memory Storage (Per-Chat Batch Queue & Lock) ---
+user_queues: Dict[int, List[events.NewMessage.Event]] = {}
 processing_locks: Dict[int, asyncio.Lock] = {}
 last_episode_numbers: Dict[int, int] = {}
-pending_tasks: Dict[str, events.NewMessage.Event] = {}  # Pending events standard memory
 
 def get_chat_lock(chat_id: int) -> asyncio.Lock:
     if chat_id not in processing_locks:
@@ -172,16 +172,116 @@ def attach_image_and_title(file_path: str, image_data: bytes, title: str) -> boo
 # --- Telegram Bot Setup ---
 bot = TelegramClient('image_tagger_bot', API_ID, API_HASH)
 
-@bot.on(events.NewMessage(incoming=True, pattern='/start'))
-async def start_handler(event):
-    await event.respond(
-        "👋 **नमस्ते! मैं एपिसोड टैगर बॉट हूँ।**\n\n"
-        "1️⃣ मुझे ऑडियो फाइल के साथ इमेज का लिंक भेजें।\n"
-        "2️⃣ नीचे दिए गए **Get Started** बटन पर क्लिक करें, और काम शुरू हो जाएगा!"
-    )
+@bot.on(events.NewMessage(incoming=True, pattern=r'^/(start|process)$'))
+async def command_handler(event):
+    chat_id = event.chat_id
+    queue = user_queues.get(chat_id, [])
+
+    if not queue:
+        await event.respond(
+            "👋 **नमस्ते!**\n\n"
+            "पहले अपनी सभी ऑडियो फाइल्स (कैप्शन में इमेज लिंक के साथ) भेजें।\n"
+            "जब सारी फाइल्स भेज दें, तो काम शुरू करने के लिए **/process** कमांड भेजें!"
+        )
+        return
+
+    chat_lock = get_chat_lock(chat_id)
+    if chat_lock.locked():
+        await event.respond("⚠️ पहले से भेजी गई फाइल्स प्रोसेस हो रही हैं, कृपया प्रतीक्षा करें...")
+        return
+
+    async with chat_lock:
+        status_msg = await event.respond(f"🚀 **{len(queue)} फाइल्स की प्रोसेसिंग शुरू हो रही है...**")
+        
+        # प्रोसेस करने के लिए क्यू की कॉपी बनाएं और लिस्ट खाली करें
+        files_to_process = list(queue)
+        user_queues[chat_id] = []
+
+        for index, msg_event in enumerate(files_to_process, start=1):
+            caption = msg_event.text or ""
+            url_match = re.search(r'https?://[^\s]+', caption)
+            image_url = url_match.group(0) if url_match else ""
+
+            if not image_url:
+                await event.respond(f"❌ फाइल #{index} में इमेज का लिंक नहीं मिला, इसे स्किप कर रहे हैं।")
+                continue
+
+            await status_msg.edit(f"⏳ **फाइल {index}/{len(files_to_process)} प्रोसेस हो रही है...**")
+
+            with tempfile.TemporaryDirectory() as temp_dir:
+                # 1. Image Download
+                if "t.me/" in image_url:
+                    image_data = await download_image_from_tg(bot, image_url)
+                else:
+                    image_data = await download_image_from_url(image_url)
+
+                if not image_data:
+                    await event.respond(f"❌ फाइल #{index} के लिए इमेज डाउनलोड विफल हुई।")
+                    continue
+
+                # 2. Extract Details for Episode Number
+                orig_title = ""
+                if msg_event.document and msg_event.document.attributes:
+                    for attr in msg_event.document.attributes:
+                        if isinstance(attr, DocumentAttributeAudio) and attr.title:
+                            orig_title = attr.title
+
+                file_ext = msg_event.file.ext or ".mp3"
+                audio_path = os.path.join(temp_dir, f"audio{file_ext}")
+                
+                await bot.download_media(msg_event.media, audio_path)
+
+                duration, meta_title = get_audio_info(audio_path)
+                raw_filename = os.path.splitext(msg_event.file.name)[0] if msg_event.file.name else ""
+
+                found_num = (
+                    extract_number_from_text(orig_title) or 
+                    extract_number_from_text(meta_title) or 
+                    extract_number_from_text(raw_filename)
+                )
+
+                if found_num is not None:
+                    final_title = f"Ep - {found_num}"
+                    last_episode_numbers[chat_id] = found_num
+                else:
+                    prev_ep = last_episode_numbers.get(chat_id, 0)
+                    next_ep = prev_ep + 1
+                    final_title = f"Ep - {next_ep}"
+                    last_episode_numbers[chat_id] = next_ep
+
+                # 3. Apply Image & Title
+                success = attach_image_and_title(audio_path, image_data, final_title)
+                if not success:
+                    await event.respond(f"❌ **{final_title}** तैयार करने में त्रुटि हुई।")
+                    continue
+
+                thumb_path = os.path.join(temp_dir, "thumb.jpg")
+                with open(thumb_path, "wb") as f:
+                    f.write(image_data)
+
+                # 4. Send File Sequentially
+                await bot.send_file(
+                    chat_id,
+                    file=audio_path,
+                    caption=f"✅ **{final_title}** तैयार!",
+                    thumb=thumb_path,
+                    attributes=[
+                        DocumentAttributeAudio(
+                            duration=duration,
+                            title=final_title,
+                            performer="Custom Cover"
+                        )
+                    ]
+                )
+
+        await status_msg.edit("🎉 **सभी फाइल्स की प्रोसेसिंग सफलतापूर्वक पूरी हो गई है!**")
 
 @bot.on(events.NewMessage(incoming=True))
-async def handle_audio_arrival(event):
+async def collect_audio_files(event):
+    # Ignore Command messages
+    if event.text and event.text.startswith('/'):
+        return
+
     if not event.media or not (event.voice or event.audio or (event.document and any(event.file.name.endswith(ext) for ext in ALLOWED_EXTENSIONS if event.file.name))):
         return
 
@@ -189,120 +289,21 @@ async def handle_audio_arrival(event):
     url_match = re.search(r'https?://[^\s]+', caption)
 
     if not url_match:
-        await event.respond("⚠️ **कृपया ऑडियो के साथ कैप्शन में इमेज का लिंक भी भेजें।**")
+        await event.respond("⚠️ **कृपया ऑडियो के कैप्शन में इमेज का लिंक भी भेजें!**")
         return
 
-    # यूनिक टास्क आईडी (Chat ID + Msg ID)
-    task_key = f"{event.chat_id}_{event.id}"
-    pending_tasks[task_key] = event
+    chat_id = event.chat_id
+    if chat_id not in user_queues:
+        user_queues[chat_id] = []
 
-    # "Get Started" बटन भेजें
-    await event.respond(
-        "📁 **फाइल प्राप्त हो गई है!**\n\nप्रोसेसिंग शुरू करने के लिए नीचे **Get Started** बटन पर क्लिक करें 👇",
-        buttons=[
-            [Button.inline("🚀 Get Started", data=f"start_{task_key}")]
-        ]
-    )
+    user_queues[chat_id].append(event)
+    count = len(user_queues[chat_id])
 
-@bot.on(events.CallbackQuery(pattern=r'^start_'))
-async def process_callback(event):
-    task_key = event.data.decode('utf-8').replace("start_", "")
-    
-    msg_event = pending_tasks.get(task_key)
-    if not msg_event:
-        await event.answer("⚠️ यह फाइल पहले ही प्रोसेस हो चुकी है या पुरानी है!", alert=True)
-        return
-
-    await event.answer("🚀 काम शुरू किया जा रहा है...")
-
-    caption = msg_event.text or ""
-    url_match = re.search(r'https?://[^\s]+', caption)
-    image_url = url_match.group(0) if url_match else ""
-
-    chat_id = msg_event.chat_id
-    chat_lock = get_chat_lock(chat_id)
-
-    # बटन हटाने के बाद स्टेटस मैसेज अपडेट करें
-    status_msg = await event.edit("⏳ **प्रोसेसिंग शुरू हो रही है...**", buttons=None)
-
-    async with chat_lock:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            # 1. Download Image
-            if "t.me/" in image_url:
-                image_data = await download_image_from_tg(bot, image_url)
-            else:
-                image_data = await download_image_from_url(image_url)
-
-            if not image_data:
-                await status_msg.edit("❌ **इमेज डाउनलोड नहीं हो सकी। लिंक जांचें!**")
-                pending_tasks.pop(task_key, None)
-                return
-
-            # 2. Extract Existing Details for Episode Number
-            orig_title = ""
-            if msg_event.document and msg_event.document.attributes:
-                for attr in msg_event.document.attributes:
-                    if isinstance(attr, DocumentAttributeAudio) and attr.title:
-                        orig_title = attr.title
-
-            file_ext = msg_event.file.ext or ".mp3"
-            audio_path = os.path.join(temp_dir, f"audio{file_ext}")
-            
-            await status_msg.edit("📥 **ऑडियो डाउनलोड हो रहा है...**")
-            await bot.download_media(msg_event.media, audio_path)
-
-            duration, meta_title = get_audio_info(audio_path)
-            raw_filename = os.path.splitext(msg_event.file.name)[0] if msg_event.file.name else ""
-
-            found_num = (
-                extract_number_from_text(orig_title) or 
-                extract_number_from_text(meta_title) or 
-                extract_number_from_text(raw_filename)
-            )
-
-            if found_num is not None:
-                final_title = f"Ep - {found_num}"
-                last_episode_numbers[chat_id] = found_num
-            else:
-                prev_ep = last_episode_numbers.get(chat_id, 0)
-                next_ep = prev_ep + 1
-                final_title = f"Ep - {next_ep}"
-                last_episode_numbers[chat_id] = next_ep
-
-            # 3. Apply Image & Ep - X Title
-            await status_msg.edit(f"🖼️ **{final_title}** तैयार किया जा रहा है...")
-            success = attach_image_and_title(audio_path, image_data, final_title)
-
-            if not success:
-                await status_msg.edit("❌ **इमेज या टाइटल सेट करने में त्रुटि हुई।**")
-                pending_tasks.pop(task_key, None)
-                return
-
-            thumb_path = os.path.join(temp_dir, "thumb.jpg")
-            with open(thumb_path, "wb") as f:
-                f.write(image_data)
-
-            # 4. Upload Back Sequentially
-            await status_msg.edit("📤 **अपलोड हो रहा है...**")
-            await bot.send_file(
-                chat_id,
-                file=audio_path,
-                caption=f"✅ **{final_title}** सफलतापूर्वक तैयार कर दिया गया है!",
-                thumb=thumb_path,
-                attributes=[
-                    DocumentAttributeAudio(
-                        duration=duration,
-                        title=final_title,
-                        performer="Custom Cover"
-                    )
-                ]
-            )
-            await status_msg.delete()
-            pending_tasks.pop(task_key, None)
+    logger.info(f"Chat {chat_id}: Added file #{count} to queue.")
 
 async def main():
     await bot.start(bot_token=BOT_TOKEN)
-    logger.info("Bot with 'Get Started' button is running...")
+    logger.info("Bot is running in Batch Queue Mode...")
     await bot.run_until_disconnected()
 
 if __name__ == "__main__":
