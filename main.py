@@ -7,7 +7,7 @@ import aiohttp
 from typing import Optional, Tuple, Dict
 
 # Telethon Imports
-from telethon import TelegramClient, events
+from telethon import TelegramClient, events, Button
 from telethon.tl.types import DocumentAttributeAudio
 
 # Mutagen Imports
@@ -23,7 +23,7 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s",
     level=logging.INFO
 )
-logger = logging.getLogger("StrictEpisodeTaggerBot")
+logger = logging.getLogger("GetStartedTaggerBot")
 
 # --- Environment Variables ---
 API_ID = 34801155
@@ -32,9 +32,10 @@ BOT_TOKEN = "8949289098:AAHtP1BrSBVXWCLhV-rOb0nLmeh0u11qTqM"
 
 ALLOWED_EXTENSIONS = {'.mp3', '.m4a', '.mp4', '.ogg', '.flac'}
 
-# --- State Management (Per-Chat Queue & Episode Counter) ---
+# --- State Management (Per-Chat Queue, Episode Counter & Pending Messages) ---
 processing_locks: Dict[int, asyncio.Lock] = {}
-last_episode_numbers: Dict[int, int] = {}  # चैट का आखिरी एपिसोड नंबर ट्रैकर
+last_episode_numbers: Dict[int, int] = {}
+pending_tasks: Dict[str, events.NewMessage.Event] = {}  # Pending events standard memory
 
 def get_chat_lock(chat_id: int) -> asyncio.Lock:
     if chat_id not in processing_locks:
@@ -42,7 +43,6 @@ def get_chat_lock(chat_id: int) -> asyncio.Lock:
     return processing_locks[chat_id]
 
 def extract_number_from_text(text: str) -> Optional[int]:
-    """किसी भी टेक्स्ट या फाइलनेम से केवल डिजिट (नंबर) निकालता है"""
     if not text:
         return None
     match = re.search(r'\d+', text)
@@ -133,10 +133,8 @@ def attach_image_and_title(file_path: str, image_data: bytes, title: str) -> boo
             if audio.tags is None:
                 audio.add_tags()
             
-            # पुराना टाइटल हटाकर केवल Ep - X लिखेगा
             audio.tags.add(TIT2(encoding=3, text=title))
             
-            # पुरानी इमेज हटाकर नई इमेज लगाएगा
             keys_to_delete = [k for k in audio.tags.keys() if k.startswith("APIC")]
             for key in keys_to_delete:
                 audio.tags.pop(key, None)
@@ -177,12 +175,13 @@ bot = TelegramClient('image_tagger_bot', API_ID, API_HASH)
 @bot.on(events.NewMessage(incoming=True, pattern='/start'))
 async def start_handler(event):
     await event.respond(
-        "👋 **नमस्ते! मैं क्लीन एपिसोड टैगर बॉट हूँ।**\n\n"
-        "मैं ऑडियो फाइल के पुराने नाम को पूरी तरह हटाकर सिर्फ **`Ep - X`** लिखूँगा और आपकी फोटो लगाऊँगा।"
+        "👋 **नमस्ते! मैं एपिसोड टैगर बॉट हूँ।**\n\n"
+        "1️⃣ मुझे ऑडियो फाइल के साथ इमेज का लिंक भेजें।\n"
+        "2️⃣ नीचे दिए गए **Get Started** बटन पर क्लिक करें, और काम शुरू हो जाएगा!"
     )
 
 @bot.on(events.NewMessage(incoming=True))
-async def process_audio(event):
+async def handle_audio_arrival(event):
     if not event.media or not (event.voice or event.audio or (event.document and any(event.file.name.endswith(ext) for ext in ALLOWED_EXTENSIONS if event.file.name))):
         return
 
@@ -193,15 +192,42 @@ async def process_audio(event):
         await event.respond("⚠️ **कृपया ऑडियो के साथ कैप्शन में इमेज का लिंक भी भेजें।**")
         return
 
-    image_url = url_match.group(0)
-    chat_id = event.chat_id
+    # यूनिक टास्क आईडी (Chat ID + Msg ID)
+    task_key = f"{event.chat_id}_{event.id}"
+    pending_tasks[task_key] = event
+
+    # "Get Started" बटन भेजें
+    await event.respond(
+        "📁 **फाइल प्राप्त हो गई है!**\n\nप्रोसेसिंग शुरू करने के लिए नीचे **Get Started** बटन पर क्लिक करें 👇",
+        buttons=[
+            [Button.inline("🚀 Get Started", data=f"start_{task_key}")]
+        ]
+    )
+
+@bot.on(events.CallbackQuery(pattern=r'^start_'))
+async def process_callback(event):
+    task_key = event.data.decode('utf-8').replace("start_", "")
+    
+    msg_event = pending_tasks.get(task_key)
+    if not msg_event:
+        await event.answer("⚠️ यह फाइल पहले ही प्रोसेस हो चुकी है या पुरानी है!", alert=True)
+        return
+
+    await event.answer("🚀 काम शुरू किया जा रहा है...")
+
+    caption = msg_event.text or ""
+    url_match = re.search(r'https?://[^\s]+', caption)
+    image_url = url_match.group(0) if url_match else ""
+
+    chat_id = msg_event.chat_id
     chat_lock = get_chat_lock(chat_id)
 
-    async with chat_lock:
-        status_msg = await event.respond("⏳ **प्रोसेसिंग शुरू हो रही है...**")
+    # बटन हटाने के बाद स्टेटस मैसेज अपडेट करें
+    status_msg = await event.edit("⏳ **प्रोसेसिंग शुरू हो रही है...**", buttons=None)
 
+    async with chat_lock:
         with tempfile.TemporaryDirectory() as temp_dir:
-            # 1. Image Download
+            # 1. Download Image
             if "t.me/" in image_url:
                 image_data = await download_image_from_tg(bot, image_url)
             else:
@@ -209,32 +235,31 @@ async def process_audio(event):
 
             if not image_data:
                 await status_msg.edit("❌ **इमेज डाउनलोड नहीं हो सकी। लिंक जांचें!**")
+                pending_tasks.pop(task_key, None)
                 return
 
-            # 2. Extract Existing Details to Find Number
+            # 2. Extract Existing Details for Episode Number
             orig_title = ""
-            if event.document and event.document.attributes:
-                for attr in event.document.attributes:
+            if msg_event.document and msg_event.document.attributes:
+                for attr in msg_event.document.attributes:
                     if isinstance(attr, DocumentAttributeAudio) and attr.title:
                         orig_title = attr.title
 
-            file_ext = event.file.ext or ".mp3"
+            file_ext = msg_event.file.ext or ".mp3"
             audio_path = os.path.join(temp_dir, f"audio{file_ext}")
             
             await status_msg.edit("📥 **ऑडियो डाउनलोड हो रहा है...**")
-            await bot.download_media(event.media, audio_path)
+            await bot.download_media(msg_event.media, audio_path)
 
             duration, meta_title = get_audio_info(audio_path)
-            raw_filename = os.path.splitext(event.file.name)[0] if event.file.name else ""
+            raw_filename = os.path.splitext(msg_event.file.name)[0] if msg_event.file.name else ""
 
-            # Check for any existing number across metadata/filename
             found_num = (
                 extract_number_from_text(orig_title) or 
                 extract_number_from_text(meta_title) or 
                 extract_number_from_text(raw_filename)
             )
 
-            # Clean Title Formatting Logic (Strictly Ep - X)
             if found_num is not None:
                 final_title = f"Ep - {found_num}"
                 last_episode_numbers[chat_id] = found_num
@@ -244,24 +269,25 @@ async def process_audio(event):
                 final_title = f"Ep - {next_ep}"
                 last_episode_numbers[chat_id] = next_ep
 
-            # 3. Apply Image & Force New Clean Title
-            await status_msg.edit(f"🖼️ Title बदला जा रहा है: **{final_title}**...")
+            # 3. Apply Image & Ep - X Title
+            await status_msg.edit(f"🖼️ **{final_title}** तैयार किया जा रहा है...")
             success = attach_image_and_title(audio_path, image_data, final_title)
 
             if not success:
                 await status_msg.edit("❌ **इमेज या टाइटल सेट करने में त्रुटि हुई।**")
+                pending_tasks.pop(task_key, None)
                 return
 
             thumb_path = os.path.join(temp_dir, "thumb.jpg")
             with open(thumb_path, "wb") as f:
                 f.write(image_data)
 
-            # 4. Upload Sequentially
-            await status_msg.edit("📤 **ऑडियो अपलोड हो रहा है...**")
+            # 4. Upload Back Sequentially
+            await status_msg.edit("📤 **अपलोड हो रहा है...**")
             await bot.send_file(
                 chat_id,
                 file=audio_path,
-                caption=f"✅ **{final_title}** तैयार कर दिया गया है!",
+                caption=f"✅ **{final_title}** सफलतापूर्वक तैयार कर दिया गया है!",
                 thumb=thumb_path,
                 attributes=[
                     DocumentAttributeAudio(
@@ -272,10 +298,11 @@ async def process_audio(event):
                 ]
             )
             await status_msg.delete()
+            pending_tasks.pop(task_key, None)
 
 async def main():
     await bot.start(bot_token=BOT_TOKEN)
-    logger.info("Bot is running in strict Ep - X title mode...")
+    logger.info("Bot with 'Get Started' button is running...")
     await bot.run_until_disconnected()
 
 if __name__ == "__main__":
