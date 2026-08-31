@@ -23,7 +23,7 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s",
     level=logging.INFO
 )
-logger = logging.getLogger("FastBatchTaggerBot")
+logger = logging.getLogger("SequentialFastTaggerBot")
 
 # --- Environment Variables ---
 API_ID = 34801155
@@ -31,7 +31,6 @@ API_HASH = "d7846c4d0f2c343dd5b67c80d45409e8"
 BOT_TOKEN = "8949289098:AAHtP1BrSBVXWCLhV-rOb0nLmeh0u11qTqM"
 
 ALLOWED_EXTENSIONS = {'.mp3', '.m4a', '.mp4', '.ogg', '.flac'}
-MAX_CONCURRENT_TASKS = 3  # एक साथ 3 फाइल्स प्रोसेस होंगी (स्पीड बढ़ाने के लिए)
 
 # --- Memory Storage ---
 user_queues: Dict[int, List[events.NewMessage.Event]] = {}
@@ -76,7 +75,7 @@ def get_audio_info(file_path: str) -> Tuple[int, str]:
         logger.error(f"Failed to read audio info: {e}")
     return duration, raw_title
 
-# --- Fast Image Downloaders ---
+# --- Image Downloaders ---
 async def download_image_from_url(session: aiohttp.ClientSession, url: str) -> Optional[bytes]:
     try:
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
@@ -165,80 +164,6 @@ def _attach_image_and_title_sync(file_path: str, image_data: bytes, title: str) 
 # --- Telegram Bot Setup ---
 bot = TelegramClient('image_tagger_bot', API_ID, API_HASH)
 
-async def process_single_file(client, msg_event, chat_id, semaphore, http_session):
-    async with semaphore:
-        caption = msg_event.text or ""
-        url_match = re.search(r'https?://[^\s]+', caption)
-        image_url = url_match.group(0) if url_match else ""
-
-        if not image_url:
-            return
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            # 1. Image Download (Fast Async)
-            if "t.me/" in image_url:
-                image_data = await download_image_from_tg(client, image_url)
-            else:
-                image_data = await download_image_from_url(http_session, image_url)
-
-            if not image_data:
-                return
-
-            # 2. Extract Title Details
-            orig_title = ""
-            if msg_event.document and msg_event.document.attributes:
-                for attr in msg_event.document.attributes:
-                    if isinstance(attr, DocumentAttributeAudio) and attr.title:
-                        orig_title = attr.title
-
-            file_ext = msg_event.file.ext or ".mp3"
-            audio_path = os.path.join(temp_dir, f"audio{file_ext}")
-
-            # Download Audio Fast
-            await client.download_media(msg_event.media, audio_path)
-
-            duration, meta_title = await asyncio.to_thread(get_audio_info, audio_path)
-            raw_filename = os.path.splitext(msg_event.file.name)[0] if msg_event.file.name else ""
-
-            found_num = (
-                extract_number_from_text(orig_title) or 
-                extract_number_from_text(meta_title) or 
-                extract_number_from_text(raw_filename)
-            )
-
-            if found_num is not None:
-                final_title = f"Ep - {found_num}"
-                last_episode_numbers[chat_id] = found_num
-            else:
-                prev_ep = last_episode_numbers.get(chat_id, 0)
-                next_ep = prev_ep + 1
-                final_title = f"Ep - {next_ep}"
-                last_episode_numbers[chat_id] = next_ep
-
-            # 3. Offload Heavy Tagging Task to Thread Pool
-            success = await asyncio.to_thread(_attach_image_and_title_sync, audio_path, image_data, final_title)
-            if not success:
-                return
-
-            thumb_path = os.path.join(temp_dir, "thumb.jpg")
-            with open(thumb_path, "wb") as f:
-                f.write(image_data)
-
-            # 4. Upload Back
-            await client.send_file(
-                chat_id,
-                file=audio_path,
-                caption=f"✅ **{final_title}** तैयार!",
-                thumb=thumb_path,
-                attributes=[
-                    DocumentAttributeAudio(
-                        duration=duration,
-                        title=final_title,
-                        performer="Custom Cover"
-                    )
-                ]
-            )
-
 @bot.on(events.NewMessage(incoming=True, pattern=r'^/(start|process)$'))
 async def command_handler(event):
     chat_id = event.chat_id
@@ -258,19 +183,91 @@ async def command_handler(event):
         return
 
     async with chat_lock:
-        status_msg = await event.respond(f"⚡ **{len(queue)} फाइल्स की तेज़ प्रोसेसिंग शुरू हो रही है...**")
+        status_msg = await event.respond(f"🚀 **{len(queue)} फाइल्स की सही क्रम (Line Sequence) में प्रोसेसिंग शुरू हो रही है...**")
         files_to_process = list(queue)
         user_queues[chat_id] = []
 
-        semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
         async with aiohttp.ClientSession() as http_session:
-            tasks = [
-                process_single_file(bot, msg, chat_id, semaphore, http_session)
-                for msg in files_to_process
-            ]
-            await asyncio.gather(*tasks)
+            # 1-by-1 strict order loop to keep exact sequence
+            for index, msg_event in enumerate(files_to_process, start=1):
+                caption = msg_event.text or ""
+                url_match = re.search(r'https?://[^\s]+', caption)
+                image_url = url_match.group(0) if url_match else ""
 
-        await status_msg.edit("⚡ **सभी फाइल्स सफलतापूर्वक और तेज़ी से प्रोसेस हो गईं!**")
+                if not image_url:
+                    await event.respond(f"❌ फाइल #{index} में इमेज का लिंक नहीं मिला, इसे स्किप कर रहे हैं।")
+                    continue
+
+                await status_msg.edit(f"⏳ **फाइल {index}/{len(files_to_process)} प्रोसेस हो रही है...**")
+
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    # Download Image Fast
+                    if "t.me/" in image_url:
+                        image_data = await download_image_from_tg(bot, image_url)
+                    else:
+                        image_data = await download_image_from_url(http_session, image_url)
+
+                    if not image_data:
+                        await event.respond(f"❌ फाइल #{index} के लिए इमेज डाउनलोड विफल हुई।")
+                        continue
+
+                    # Extract Original Title for Episode Numbering
+                    orig_title = ""
+                    if msg_event.document and msg_event.document.attributes:
+                        for attr in msg_event.document.attributes:
+                            if isinstance(attr, DocumentAttributeAudio) and attr.title:
+                                orig_title = attr.title
+
+                    file_ext = msg_event.file.ext or ".mp3"
+                    audio_path = os.path.join(temp_dir, f"audio{file_ext}")
+                    
+                    # Download Audio
+                    await bot.download_media(msg_event.media, audio_path)
+
+                    duration, meta_title = await asyncio.to_thread(get_audio_info, audio_path)
+                    raw_filename = os.path.splitext(msg_event.file.name)[0] if msg_event.file.name else ""
+
+                    found_num = (
+                        extract_number_from_text(orig_title) or 
+                        extract_number_from_text(meta_title) or 
+                        extract_number_from_text(raw_filename)
+                    )
+
+                    if found_num is not None:
+                        final_title = f"Ep - {found_num}"
+                        last_episode_numbers[chat_id] = found_num
+                    else:
+                        prev_ep = last_episode_numbers.get(chat_id, 0)
+                        next_ep = prev_ep + 1
+                        final_title = f"Ep - {next_ep}"
+                        last_episode_numbers[chat_id] = next_ep
+
+                    # Attach Cover & Title using non-blocking thread
+                    success = await asyncio.to_thread(_attach_image_and_title_sync, audio_path, image_data, final_title)
+                    if not success:
+                        await event.respond(f"❌ **{final_title}** तैयार करने में त्रुटि हुई।")
+                        continue
+
+                    thumb_path = os.path.join(temp_dir, "thumb.jpg")
+                    with open(thumb_path, "wb") as f:
+                        f.write(image_data)
+
+                    # Upload Immediately In Order
+                    await bot.send_file(
+                        chat_id,
+                        file=audio_path,
+                        caption=f"✅ **{final_title}** तैयार!",
+                        thumb=thumb_path,
+                        attributes=[
+                            DocumentAttributeAudio(
+                                duration=duration,
+                                title=final_title,
+                                performer="Custom Cover"
+                            )
+                        ]
+                    )
+
+        await status_msg.edit("🎉 **सभी फाइल्स सही क्रम (Sequentially) में अपलोड हो गई हैं!**")
 
 @bot.on(events.NewMessage(incoming=True))
 async def collect_audio_files(event):
@@ -293,7 +290,7 @@ async def collect_audio_files(event):
 
 async def main():
     await bot.start(bot_token=BOT_TOKEN)
-    logger.info("Fast Batch Bot running...")
+    logger.info("Sequential Fast Bot Running...")
     await bot.run_until_disconnected()
 
 if __name__ == "__main__":
@@ -301,4 +298,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         logger.info("Bot stopped.")
-        
+                    
